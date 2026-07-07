@@ -120,10 +120,24 @@ async function startSock() {
  * the matching website conversation.
  */
 async function onMessages(ev) {
-	if (ev.type !== 'notify' || !Array.isArray(ev.messages)) return;
+	// 'notify' = real-time messages; 'append' = messages you send from your own
+	// phone (e.g. a reply in "Message yourself"). We want both.
+	if (!ev || !Array.isArray(ev.messages)) return;
+	if (ev.type !== 'notify' && ev.type !== 'append') return;
+
+	const nowSec = Math.floor(Date.now() / 1000);
 
 	for (const msg of ev.messages) {
-		if (!msg.message) continue;
+		if (!msg.message || !msg.key) continue;
+
+		// De-dupe: WhatsApp can surface the same message in more than one event.
+		if (seenMessage(msg.key.id)) continue;
+
+		// Ignore history replayed on reconnect so we don't re-forward old messages.
+		const ts = typeof msg.messageTimestamp === 'number'
+			? msg.messageTimestamp
+			: (msg.messageTimestamp && Number(msg.messageTimestamp.low)) || 0;
+		if (ts && nowSec - ts > 120) continue;
 
 		const text = extractText(msg.message);
 		if (!text) continue;
@@ -140,7 +154,10 @@ async function onMessages(ev) {
 			// Fallback: a plain reply (no quote) routes to the most recent visitor,
 			// but never treat our own forwarded notification as a reply.
 			if (CODE_RE.test(text)) continue; // this IS a forwarded notification.
-			if (!lastCode) continue;
+			if (!lastCode) {
+				log.info('Reply without a [code] quote and no recent visitor — ignoring.');
+				continue;
+			}
 			code = lastCode;
 		}
 
@@ -148,8 +165,19 @@ async function onMessages(ev) {
 		const body = text.replace(CODE_RE, '').trim();
 		if (!body) continue;
 
+		log.info({ code, fromMe: !!msg.key.fromMe, quoted: !!mq }, 'Routing WhatsApp reply to WordPress');
 		await forwardToWP(code, body);
 	}
+}
+
+/** Remember the last ~500 handled message IDs to avoid double-forwarding. */
+const _seen = new Set();
+function seenMessage(id) {
+	if (!id) return false;
+	if (_seen.has(id)) return true;
+	_seen.add(id);
+	if (_seen.size > 500) { _seen.delete(_seen.values().next().value); }
+	return false;
 }
 
 /* ------------------------------------------------------------------ helpers */
