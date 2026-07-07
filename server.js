@@ -53,75 +53,115 @@ let latestQR = null; // data URL
 let me = ''; // human phone number
 let lastCode = ''; // most recent visitor code we forwarded (plain-reply fallback)
 let reconnectAttempts = 0; // for exponential reconnect backoff
+let reconnectTimer = null;  // exactly one pending reconnect at a time
+let starting = false;       // guard against concurrent startSock() calls
 
 const CODE_RE = /\[([A-Z0-9]{4,20})\]/; // matches the [ABC123] tag we embed
 
 /* --------------------------------------------------------- WhatsApp socket */
 
+/** Schedule a single reconnect (never stack them — that causes 440 storms). */
+function scheduleReconnect(delay) {
+	if (reconnectTimer) { return; }
+	reconnectTimer = setTimeout(() => { reconnectTimer = null; startSock(); }, delay);
+}
+
+/** Fully tear down the current socket so two sockets never share the creds. */
+function teardownSock() {
+	if (!sock) { return; }
+	try { sock.ev.removeAllListeners(); } catch (e) { /* noop */ }
+	try { sock.end(undefined); } catch (e) { /* noop */ }
+	sock = null;
+}
+
 async function startSock() {
-	const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
-	const { version } = await fetchLatestBaileysVersion();
+	if (starting) { return; }
+	starting = true;
+	try {
+		teardownSock(); // ensure only ONE live socket exists at any time
 
-	sock = makeWASocket({
-		version,
-		auth: state,
-		logger: pino({ level: 'silent' }),
-		printQRInTerminal: false,
-		browser: ['WA Chat Bridge', 'Chrome', '1.0.0'],
-		markOnlineOnConnect: false,
-	});
+		const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
+		const { version } = await fetchLatestBaileysVersion();
 
-	sock.ev.on('creds.update', saveCreds);
+		sock = makeWASocket({
+			version,
+			auth: state,
+			logger: pino({ level: 'silent' }),
+			printQRInTerminal: false,
+			browser: ['WA Chat Bridge', 'Chrome', '1.0.0'],
+			markOnlineOnConnect: false,
+			syncFullHistory: false,
+		});
 
-	sock.ev.on('connection.update', async (u) => {
-		const { connection, lastDisconnect, qr } = u;
+		sock.ev.on('creds.update', saveCreds);
+		sock.ev.on('messages.upsert', onMessages);
+		sock.ev.on('connection.update', onConnectionUpdate);
+	} finally {
+		starting = false;
+	}
+}
 
-		if (qr) {
-			try {
-				latestQR = await QR.toDataURL(qr, { margin: 1, width: 320 });
-				status = 'qr';
-				log.info('QR updated — scan to link.');
-			} catch (e) {
-				log.error(e, 'QR encode failed');
-			}
+async function onConnectionUpdate(u) {
+	const { connection, lastDisconnect, qr } = u;
+
+	if (qr) {
+		try {
+			latestQR = await QR.toDataURL(qr, { margin: 1, width: 320 });
+			status = 'qr';
+			log.info('QR updated — scan to link.');
+		} catch (e) {
+			log.error(e, 'QR encode failed');
 		}
+	}
 
-		if (connection === 'open') {
-			status = 'connected';
-			latestQR = null;
-			me = sock.user && sock.user.id ? jidToPhone(sock.user.id) : '';
-			log.info({ me }, 'WhatsApp connected.');
-		}
+	if (connection === 'open') {
+		status = 'connected';
+		latestQR = null;
+		reconnectAttempts = 0;
+		me = sock && sock.user && sock.user.id ? jidToPhone(sock.user.id) : '';
+		log.info({ me }, 'WhatsApp connected.');
+		return;
+	}
 
-		if (connection === 'open') {
-			reconnectAttempts = 0;
-		}
+	if (connection !== 'close') { return; }
 
-		if (connection === 'close') {
-			status = 'disconnected';
-			const code = (lastDisconnect && lastDisconnect.error && lastDisconnect.error.output)
-				? lastDisconnect.error.output.statusCode
-				: 0;
+	status = 'disconnected';
+	const code = (lastDisconnect && lastDisconnect.error && lastDisconnect.error.output)
+		? lastDisconnect.error.output.statusCode
+		: 0;
 
-			if (code === DisconnectReason.loggedOut) {
-				// A real unlink (or an expired/reused pairing). Clear creds so a fresh
-				// QR is issued. NOTE: on a host without a persistent disk (e.g. Render
-				// free tier) the auth is wiped on every restart, so this can loop —
-				// see AUTH_DIR + a mounted disk in the README.
-				log.warn({ code }, 'Logged out — clearing auth, waiting for a new QR.');
-				clearAuth();
-				setTimeout(startSock, 3000);
-			} else {
-				// Exponential backoff so we never hammer a tight reconnect loop.
-				reconnectAttempts = Math.min(reconnectAttempts + 1, 6);
-				const delay = Math.min(30000, 2000 * Math.pow(2, reconnectAttempts - 1));
-				log.warn({ code, delay, attempt: reconnectAttempts }, 'Connection closed — reconnecting.');
-				setTimeout(startSock, delay);
-			}
-		}
-	});
+	// Retire the dead socket BEFORE any reconnect so the old and new sockets never
+	// coexist (coexisting sockets on the same account cause 440/connectionReplaced).
+	teardownSock();
 
-	sock.ev.on('messages.upsert', onMessages);
+	if (code === DisconnectReason.loggedOut) {
+		// Real unlink (or expired/reused pairing) — clear creds, wait for a new QR.
+		log.warn({ code }, 'Logged out — clearing auth, waiting for a new QR.');
+		clearAuth();
+		scheduleReconnect(3000);
+		return;
+	}
+
+	if (code === DisconnectReason.connectionReplaced) {
+		// Another WhatsApp Web session took over this number. Reconnecting immediately
+		// just starts a tug-of-war (the 440 loop). Back off well so only one wins.
+		log.warn({ code }, 'Connection replaced by another session — pausing before one reconnect. Make sure only ONE gateway instance runs and WhatsApp Web is not open elsewhere.');
+		scheduleReconnect(20000);
+		return;
+	}
+
+	if (code === DisconnectReason.restartRequired) {
+		// Expected right after a successful QR scan — reconnect promptly, once.
+		log.info({ code }, 'Restart required — reconnecting.');
+		scheduleReconnect(1000);
+		return;
+	}
+
+	// Everything else (408 timeouts, transient closes): single reconnect w/ backoff.
+	reconnectAttempts = Math.min(reconnectAttempts + 1, 6);
+	const delay = Math.min(30000, 2000 * Math.pow(2, reconnectAttempts - 1));
+	log.warn({ code, delay, attempt: reconnectAttempts }, 'Connection closed — reconnecting.');
+	scheduleReconnect(delay);
 }
 
 /**
@@ -282,12 +322,14 @@ app.post('/send', async (req, res) => {
 
 app.post('/logout', async (req, res) => {
 	try {
+		if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
 		if (sock) {
 			try { await sock.logout(); } catch (e) { /* ignore */ }
 		}
+		teardownSock();
 		clearAuth();
 		status = 'connecting';
-		setTimeout(startSock, 800);
+		scheduleReconnect(800);
 		res.json({ ok: true });
 	} catch (e) {
 		res.status(500).json({ error: 'logout failed' });
