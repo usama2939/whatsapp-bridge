@@ -1,0 +1,22 @@
+{
+  "name": "wa-chat-bridge-gateway",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Baileys WhatsApp gateway for the WA Chat Bridge WordPress plugin.",
+  "type": "commonjs",
+  "main": "server.js",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "@hapi/boom": "^10.0.1",
+    "@whiskeysockets/baileys": "^6.7.9",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "pino": "^9.5.0",
+    "qrcode": "^1.5.4"
+  }
+}
