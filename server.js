@@ -52,6 +52,7 @@ let status = 'connecting'; // connecting | qr | connected | disconnected
 let latestQR = null; // data URL
 let me = ''; // human phone number
 let lastCode = ''; // most recent visitor code we forwarded (plain-reply fallback)
+let reconnectAttempts = 0; // for exponential reconnect backoff
 
 const CODE_RE = /\[([A-Z0-9]{4,20})\]/; // matches the [ABC123] tag we embed
 
@@ -92,21 +93,30 @@ async function startSock() {
 			log.info({ me }, 'WhatsApp connected.');
 		}
 
+		if (connection === 'open') {
+			reconnectAttempts = 0;
+		}
+
 		if (connection === 'close') {
 			status = 'disconnected';
-			const code = (lastDisconnect && lastDisconnect.error instanceof Boom)
+			const code = (lastDisconnect && lastDisconnect.error && lastDisconnect.error.output)
 				? lastDisconnect.error.output.statusCode
-				: (lastDisconnect && lastDisconnect.error && lastDisconnect.error.output
-					? lastDisconnect.error.output.statusCode
-					: 0);
+				: 0;
 
 			if (code === DisconnectReason.loggedOut) {
-				log.warn('Logged out — clearing auth, waiting for a new QR.');
+				// A real unlink (or an expired/reused pairing). Clear creds so a fresh
+				// QR is issued. NOTE: on a host without a persistent disk (e.g. Render
+				// free tier) the auth is wiped on every restart, so this can loop —
+				// see AUTH_DIR + a mounted disk in the README.
+				log.warn({ code }, 'Logged out — clearing auth, waiting for a new QR.');
 				clearAuth();
-				setTimeout(startSock, 1500);
+				setTimeout(startSock, 3000);
 			} else {
-				log.warn({ code }, 'Connection closed — reconnecting.');
-				setTimeout(startSock, 2500);
+				// Exponential backoff so we never hammer a tight reconnect loop.
+				reconnectAttempts = Math.min(reconnectAttempts + 1, 6);
+				const delay = Math.min(30000, 2000 * Math.pow(2, reconnectAttempts - 1));
+				log.warn({ code, delay, attempt: reconnectAttempts }, 'Connection closed — reconnecting.');
+				setTimeout(startSock, delay);
 			}
 		}
 	});
